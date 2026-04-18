@@ -1,0 +1,68 @@
+{
+  "name": "kysely-compose",
+  "version": "0.1.0",
+  "description": "Ergonomic conditional query helpers for Kysely — equalsIfValue, inIfValue, onlyWhen, optionalJoin and more",
+  "keywords": [
+    "kysely",
+    "sql",
+    "ts-sql-query",
+    "psql",
+    "orm",
+    "query-builder",
+    "typescript",
+    "postgresql",
+    "conditional"
+  ],
+  "author": "dubey2k",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourname/kysely-fluent.git"
+  },
+  "sideEffects": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm run typecheck",
+    "release": "changeset publish",
+    "version": "changeset version",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "kysely": ">=0.26.0"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.5.0",
+    "@changesets/cli": "^2.27.0",
+    "@types/node": "^22.0.0",
+    "kysely": "^0.27.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  }
+}
