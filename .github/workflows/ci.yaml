@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
     branches: [main]
@@ -6,14 +7,60 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  # Matrix job — runs typecheck + tests + build across the supported Node and
+  # Kysely floor / latest range. Catches:
+  #   - Resolver breakage if a future kysely release changes its export shape
+  #     (the SelectQueryBuilder probe is the most fragile path).
+  #   - Type-level regressions on Node versions our `engines` field promises.
+  #   - SQL-output drift from kysely's compiler between minor versions.
+  test:
+    name: Node ${{ matrix.node }} / kysely ${{ matrix.kysely }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20", "22"]
+        kysely: ["0.26", "0.27"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies (locked)
+        run: npm ci
+
+      # Swap in the targeted kysely version WITHOUT mutating package.json or
+      # the lockfile — keeps the matrix isolated and reproducible.
+      - name: Pin kysely to ${{ matrix.kysely }}
+        run: |
+          npm install --no-save "kysely@^${{ matrix.kysely }}.0"
+          node -e "console.log('using kysely', require('kysely/package.json').version)"
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+  # Single-shot publishability gate — confirms the package as it would ship
+  # against the lockfile-pinned kysely passes everything. Mirrors the
+  # release workflow's preflight so red here means red on release too.
+  publishable:
+    name: Publishable preflight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run test
       - run: npm run build

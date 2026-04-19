@@ -101,6 +101,16 @@ import type {
   SelectType,
 } from "kysely";
 
+// ESM namespace import — critical that this is NOT `require("kysely")` even
+// in CJS output, because module-realm-aware loaders (vitest's vite-SSR,
+// Jest's experimental ESM, dual-pkg setups) can otherwise hand us a different
+// kysely instance than the consumer ends up importing — patching one
+// prototype wouldn't affect calls reaching the other realm. ESM `import *`
+// resolves through the host's module graph, so we always touch the same
+// instance the consumer does.
+import * as kyselyRuntimeNs from "kysely";
+const kyselyRuntime = kyselyRuntimeNs as unknown as Record<string, unknown>;
+
 // Locally re-defined to avoid importing `SqlBool` from kysely — it was only
 // added to the public type export surface in 0.27. Keeping a local alias with
 // the EXACT same shape (`boolean | 0 | 1`, see kysely/util/type-utils) lets
@@ -817,39 +827,148 @@ declare module "kysely" {
   }
 }
 
-// ─── Runtime prototype patch ──────────────────────────────────────────────────
+// ─── Runtime prototype resolution ─────────────────────────────────────────────
 //
-// Kysely uses two runtime-class patterns across builders:
-//   - SelectQueryBuilder is an interface whose runtime class is `SelectQueryBuilderImpl`
-//   - UpdateQueryBuilder / DeleteQueryBuilder ARE classes directly
-// We accept both shapes so this file works across versions without caring
-// which pattern is in play.
+// Kysely's runtime class layout is uneven across versions:
+//   - SelectQueryBuilder is an interface; the concrete class `SelectQueryBuilderImpl`
+//     lives in an internal module and is NOT re-exported from the package root
+//     (verified on 0.26-0.27). Only the `createSelectQueryBuilder` factory and
+//     `SelectQueryNode` are public.
+//   - UpdateQueryBuilder / DeleteQueryBuilder ARE exported as runtime classes
+//     directly.
+//
+// To stay robust across versions, each builder uses a 2-tier resolver:
+//   1. DIRECT EXPORT — try `${Name}Impl` then `${Name}` from the package root.
+//      Cheapest path; works for U/D today and will work for S if Kysely ever
+//      starts exporting the impl.
+//   2. PROBE — construct a throwaway instance via the public factory or
+//      constructor with a minimal stub, then read `Object.getPrototypeOf(it)`.
+//      The probe instance is never executed and is GC-eligible immediately.
+//
+// All probe inputs use only PUBLIC kysely exports (createSelectQueryBuilder,
+// SelectQueryNode, UpdateQueryBuilder, UpdateQueryNode, TableNode,
+// DeleteQueryBuilder, DeleteQueryNode). No deep imports, no internals.
 
 type ProtoRecord = Record<string, unknown>;
-type AnyCtor = { prototype: any };
+type AnyCtor = { prototype: unknown };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type ProbeFn = () => any;
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const kyselyRuntime = require("kysely") as Record<string, unknown>;
+/** No-op executor stub — the probe instance never executes a query. */
+const STUB_EXECUTOR = { transformQuery: <T>(q: T): T => q };
+const STUB_QUERY_ID = { queryId: "__kysely-compose-probe__" };
 
-function resolveProto<T>(name: string): T & ProtoRecord {
-  // Try `${name}Impl` first (interface+impl pattern), then bare `${name}` (class pattern).
-  const candidates = [`${name}Impl`, name];
-  for (const key of candidates) {
-    const ctor = kyselyRuntime[key] as AnyCtor | undefined;
+/** Read a public export by name, returning `undefined` if missing. */
+function pickExport<T>(name: string): T | undefined {
+  return kyselyRuntime[name] as T | undefined;
+}
+
+/**
+ * Resolve a builder prototype by trying direct exports first, then probing
+ * the public constructor/factory. Throws a clear, actionable error if both
+ * paths fail (which would only happen on a major Kysely refactor).
+ */
+function resolveProto(
+  builderName: string,
+  directExports: readonly string[],
+  probe: ProbeFn
+): ProtoRecord {
+  for (const key of directExports) {
+    const ctor = pickExport<AnyCtor>(key);
     if (ctor && typeof ctor === "function" && ctor.prototype) {
-      return ctor.prototype as T & ProtoRecord;
+      return ctor.prototype as ProtoRecord;
     }
   }
+
+  try {
+    const instance = probe();
+    const proto = Object.getPrototypeOf(instance) as ProtoRecord | null;
+    if (proto && typeof (proto as { where?: unknown }).where === "function") {
+      return proto;
+    }
+  } catch (err) {
+    throw new Error(
+      `kysely-compose: failed to probe ${builderName} prototype ` +
+        `(direct exports [${directExports.join(", ")}] not found, probe threw: ` +
+        `${err instanceof Error ? err.message : String(err)}). ` +
+        `Your installed Kysely version may be incompatible — please file an issue.`
+    );
+  }
+
   throw new Error(
-    `kysely-compose: could not locate runtime class for "${name}". ` +
-      `Tried exports: [${candidates.join(", ")}]. ` +
-      `This likely means the installed Kysely version is incompatible.`
+    `kysely-compose: could not resolve runtime prototype for ${builderName}. ` +
+      `Tried direct exports [${directExports.join(", ")}] and a constructor probe. ` +
+      `Your installed Kysely version may be incompatible — please file an issue.`
   );
 }
 
-const selectProto = resolveProto<AnyQB>("SelectQueryBuilder");
-const updateProto = resolveProto<AnyUQB>("UpdateQueryBuilder");
-const deleteProto = resolveProto<AnyDQB>("DeleteQueryBuilder");
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type NodeCreator = (...args: any[]) => unknown;
+
+/** Pull a `.create(...)` factory off a Kysely *Node namespace export. */
+function pickNodeCreate(name: string): NodeCreator {
+  const ns = pickExport<{ create?: NodeCreator }>(name);
+  const create = ns?.create;
+  if (typeof create !== "function") {
+    throw new Error(`kysely-compose: missing public export "${name}.create"`);
+  }
+  return create;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type FactoryFn = (props: any) => unknown;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type BuilderCtor = new (props: any) => unknown;
+
+/** Build the standard QueryBuilder constructor props using a given query node. */
+function buildBuilderProps(queryNode: unknown): Record<string, unknown> {
+  return {
+    queryId: STUB_QUERY_ID,
+    executor: STUB_EXECUTOR,
+    queryNode,
+  };
+}
+
+const selectProto = resolveProto(
+  "SelectQueryBuilder",
+  ["SelectQueryBuilderImpl", "SelectQueryBuilder"],
+  () => {
+    const factory = pickExport<FactoryFn>("createSelectQueryBuilder");
+    if (typeof factory !== "function") {
+      throw new Error('missing public export "createSelectQueryBuilder"');
+    }
+    const selectNode = pickNodeCreate("SelectQueryNode")();
+    return factory(buildBuilderProps(selectNode));
+  }
+);
+
+const updateProto = resolveProto(
+  "UpdateQueryBuilder",
+  ["UpdateQueryBuilderImpl", "UpdateQueryBuilder"],
+  () => {
+    const Ctor = pickExport<BuilderCtor>("UpdateQueryBuilder");
+    if (typeof Ctor !== "function") {
+      throw new Error('missing public export "UpdateQueryBuilder"');
+    }
+    const tableNode = pickNodeCreate("TableNode")("__probe__");
+    const updateNode = pickNodeCreate("UpdateQueryNode")(tableNode);
+    return new Ctor(buildBuilderProps(updateNode));
+  }
+);
+
+const deleteProto = resolveProto(
+  "DeleteQueryBuilder",
+  ["DeleteQueryBuilderImpl", "DeleteQueryBuilder"],
+  () => {
+    const Ctor = pickExport<BuilderCtor>("DeleteQueryBuilder");
+    if (typeof Ctor !== "function") {
+      throw new Error('missing public export "DeleteQueryBuilder"');
+    }
+    const tableNode = pickNodeCreate("TableNode")("__probe__");
+    const deleteNode = pickNodeCreate("DeleteQueryNode")([tableNode]);
+    return new Ctor(buildBuilderProps(deleteNode));
+  }
+);
 
 // ─── Idempotency guard ────────────────────────────────────────────────────────
 // Multiple imports across module realms (jest, bundlers, monorepos) can run
