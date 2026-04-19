@@ -1,6 +1,6 @@
 {
   "name": "kysely-compose",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ergonomic conditional query helpers for Kysely — equalsIfValue, inIfValue, onlyWhen, optionalJoin and more",
   "keywords": [
     "kysely",
